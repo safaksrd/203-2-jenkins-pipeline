@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  This Cloudformation Template deploys Phonebook Application to five Docker Machines on EC2 Instances which are ready for Docker Swarm operations. Docker Machines will run on Amazon Linux 2 with custom security group allowing SSH (22), HTTP (80) UDP (4789, 7946), and TCP(2377, 7946, 8080) connections from anywhere.
+  User needs to select appropriate key name when launching the template.
+
+Parameters:
+  KeyPairName:
+    Description: Enter the name of your Key Pair for SSH connections.
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be one of the existing EC2 KeyPair
+
+Resources:
+  InstanceConnectPolicy: # Private key i herhangi biryere yazmayacagiz, dolayisiyla private key siz bir cozum icin once policy olustururuz sonra bu policy i Role a atariz. private key e ihtiyac duymadan makinelerin birbirine policy araciligi ile public key gondermesini saglayan bir policy
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      PolicyDocument: #required
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2-instance-connect:SendSSHPublicKey
+            Resource:
+              - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/* # hangi makineleer birbirine baglanmak istiyorsa yada siz bunun baglanmasini istediginiz makine hangisiyse. Sondaki * in anlami bu policy i hangi instance a  atarsam o instance bu hakka sahip olur
+            Condition: {"StringEquals": {"aws:ResourceTag/project":"202"}} # Name project keyvalue 202 olan makineler kullanacak. Bu tage sahip olan makinelerde bu policy uygulanacak
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+            Resource: "*"
+  
+  EC2InstanceConnect: # node larin kendi arasinda konusabilmesi ve ECR a ulasabilmesi icin role tanimliyoruz
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com # bu Role ec2 lar da tanimli olacak
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns: # Bu Role e 2 tane Policy ekliyoruz. birisi AWS de olmayan bizim yukarida hazirladigimiz Instance Connect Policy digeri AWS de olan Container Registry Full Access policy
+        - !Ref InstanceConnectPolicy # AWS de olmayan bir policy kullanmak istedigimizde bunu once yukaridaki gibi olustururuz sonra burada refere ederiz.
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess # AWS de varolan bir policy kullanirken ARN no girmek yeterli
+  
+  EC2ConnectProfile: # EC2 lari olustururken sadece bu profile i ec2 ya ilistirmek yeterli olacak Policy->Role->Profile üclüsü birarada sanirim
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles: #required
+        - !Ref EC2InstanceConnect # eklemek istedigimiz Role u refere ediyoruz
+  
+  DockerMachinesSecurityGroup: # TCP port 2377 for cluster management communications, TCP and UDP port 7946 for communication among nodes, UDP port 4789 for overlay network traffic
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP for Docker Machines
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2377
+          ToPort: 2377
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7946
+          ToPort: 7946
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 7946
+          ToPort: 7946
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 4789
+          ToPort: 4789
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp # grand master daki visualizer icin
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+  
+  ManagerLT:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0022f774911c1d690
+        InstanceType: t2.micro
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile: 
+          Arn: !GetAtt EC2ConnectProfile.Arn # Instance Role eklerken Ref ile ekliyoruz. Launch Template Role eklerken arn ile ekliyoruz.
+        SecurityGroupIds:
+          - !GetAtt DockerMachinesSecurityGroup.GroupId # Sec group un goup id sini cekiyoruz
+        UserData:
+          Fn::Base64: 
+            !Sub |
+              #! /bin/bash
+              yum update -y
+              amazon-linux-extras install docker -y
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              yum install python3 -y
+              # mssh komutunun kullanilabilmesi icin asagidaki komut girilir
+              pip3 install ec2instanceconnectcli
+              # ornek eval komutu: eval "$(echo "date")" -> parantez icinden date gelir. shell de date komutu calistirilir. 
+              # Yukarida ayarlanan policy-role-profile ayari sayesinde asagidaki komut ile Swarm in initialize edildigi grandmaster da DockerManager1 makinesine baglanti oncesi yes/no diye sormaksizin baglanilir, ardindan manager node token inin yer aldigi docker komutu cekilir ve bu komutu eval ile calistirarak swarm a manager olarak eklenmesi saglanir.
+              eval "$(mssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  \
+                --region ${AWS::Region} ${DockerManager1} docker swarm join-token manager | grep -i 'docker')"
+              # uninstall aws cli version 1
+              rm -rf /bin/aws
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              # Dokumana gore: Amazon ECR Docker Credential Helper makes it easy for developers to use ECR without the need to use docker login or write logic to refresh tokens and provide transparent access to ECR repositories.
+              yum install amazon-ecr-credential-helper -y
+              # Dokumana gore: Place the docker-credential-ecr-login binary on your PATH and set the contents of your ~/.docker/config.json file to be:
+              mkdir -p /home/ec2-user/.docker
+              cd /home/ec2-user/.docker
+              echo '{"credsStore": "ecr-login"}' > config.json
+  
+  WorkerLT:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-04d29b6f966df1537
+        InstanceType: t2.micro
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile: 
+          Arn: !GetAtt EC2ConnectProfile.Arn # Instance a Role eklerken Ref ile ekliyoruz. Launch Template a Role eklerken arn ile ekliyoruz.
+        SecurityGroupIds:
+          - !GetAtt DockerMachinesSecurityGroup.GroupId
+        UserData:
+          Fn::Base64: 
+            !Sub |
+              #! /bin/bash
+              yum update -y
+              amazon-linux-extras install docker -y
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+              -o /usr/local/bin/docker-compose
+              chmod +x /usr/local/bin/docker-compose
+              yum install python3 -y
+              # mssh komutunun kullanilabilmesi icin asagidaki komut girilir
+              pip3 install ec2instanceconnectcli
+              # ornek eval komutu: eval "$(echo "date")" -> parantez icinden date gelir. shell de date komutu calistirilir. 
+              # Yukarida ayarlanan policy-role-profile ayari sayesinde asagidaki komut ile Swarm in initialize edildigi grandmaster da DockerManager1 makinesine baglanti oncesi yes/no diye sormaksizin baglanilir, ardindan worker node token inin yer aldigi docker komutu cekilir ve bu komutu eval ile calistirarak swarm a worker olarak eklenmesi saglanir.
+              eval "$(mssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no  \
+                --region ${AWS::Region} ${DockerManager1} docker swarm join-token worker | grep -i 'docker')"
+              # uninstall aws cli version 1
+              rm -rf /bin/aws
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              ./aws/install
+              # Dokumana gore: Amazon ECR Docker Credential Helper makes it easy for developers to use ECR without the need to use docker login or write logic to refresh tokens and provide transparent access to ECR repositories.
+              yum install amazon-ecr-credential-helper -y
+              # Dokumana gore: Place the docker-credential-ecr-login binary on your PATH and set the contents of your ~/.docker/config.json file to be:
+              mkdir -p /home/ec2-user/.docker
+              cd /home/ec2-user/.docker
+              echo '{"credsStore": "ecr-login"}' > config.json
+  
+  DockerManager1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-04d29b6f966df1537
+      InstanceType: t2.medium
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2ConnectProfile # Instance a Role eklerken Ref ile ekliyoruz. Launch Template a Role eklerken arn ile ekliyoruz.
+      SecurityGroupIds:
+        - !GetAtt DockerMachinesSecurityGroup.GroupId
+      Tags:                
+        - Key: Name
+          Value: !Sub Docker Manager 1st of ${AWS::StackName}                      
+        - Key: server
+          Value: docker-grand-master # jenkinsfile da Deploying the Application stepinde bu value filtreleme icin kullanilir
+        - Key: project
+          Value: "202"
+      UserData: # Grand Master in kurulumu digerlerinden farkli, burada Swarm yüklü olacak
+        Fn::Base64: |
+          #! /bin/bash
+          yum update -y
+          hostnamectl set-hostname Grand-Master
+          amazon-linux-extras install docker -y
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" \
+          -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          docker swarm init
+          yum install git -y
+          docker service create \
+            --name=viz \
+            --publish=8080:8080/tcp \
+            --constraint=node.role==manager \
+            --mount=type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+            dockersamples/visualizer
+          # uninstall aws cli version 1
+          rm -rf /bin/aws
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+          yum install amazon-ecr-credential-helper -y
+          mkdir -p /home/ec2-user/.docker
+          cd /home/ec2-user/.docker
+          echo '{"credsStore": "ecr-login"}' > config.json
+  
+  DockerManager2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DockerManager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ManagerLT
+        Version: !GetAtt ManagerLT.LatestVersionNumber 
+      Tags:                
+        - Key: server
+          Value: docker-manager-2                       
+        - Key: Name
+          Value: !Sub Docker Manager 2nd of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  
+  DockerManager3:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DockerManager2
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ManagerLT
+        Version: !GetAtt ManagerLT.LatestVersionNumber
+      Tags:                
+        - Key: server
+          Value: docker-manager-3                        
+        - Key: Name
+          Value: !Sub Docker Manager 3rd of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  
+  DockerWorker1:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DockerManager2
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLT
+        Version: !GetAtt WorkerLT.LatestVersionNumber
+      Tags:                
+        - Key: server
+          Value: docker-worker-1                       
+        - Key: Name
+          Value: !Sub Docker Worker 1st of ${AWS::StackName}
+        - Key: project
+          Value: "202"
+  
+  DockerWorker2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DockerWorker1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLT
+        Version: !GetAtt WorkerLT.LatestVersionNumber 
+      Tags:                
+        - Key: server
+          Value: docker-worker-2                       
+        - Key: Name
+          Value: !Sub Docker Worker 2nd of ${AWS::StackName}
+        - Key: project
+          Value: "202" 
+
+Outputs:
+  1stDockerManagerDashboard:
+    Description: Dashboard for Docker Swarm
+    Value: !Sub 
+      - http://${PublicAddress}:8080
+      - PublicAddress: !GetAtt DockerManager1.PublicDnsName
+  1stDockerManagerDNSName:
+    Description: Docker Manager 1st DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager1.PublicDnsName
+  2ndDockerManagerDNSName:
+    Description: Docker Manager 2nd DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager2.PublicDnsName
+  3rdDockerManagerDNSName:
+    Description: Docker Manager 3rd DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerManager3.PublicDnsName
+  1stDockerWorkerDNSName:
+    Description: Docker Worker 1st DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerWorker1.PublicDnsName
+  2ndDockerWorkerDNSName:
+    Description: Docker Worker 2nd DNS Name
+    Value: !Sub 
+      - ${PublicAddress}
+      - PublicAddress: !GetAtt DockerWorker2.PublicDnsName
+  
