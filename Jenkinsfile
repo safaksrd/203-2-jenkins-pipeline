@@ -1,6 +1,6 @@
 pipeline {
     agent {
-        label 'any'
+        label 'master'
     }
     environment{
         PATH=sh(script:"echo $PATH:/usr/local/bin", returnStdout:true).trim()
@@ -10,10 +10,10 @@ pipeline {
         // AWS Account ID yi cekiyor
         ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         // ECR repo isminin ön kismi
-        APP_REPO_NAME = "leon-repo/phonebook-app"
+        APP_REPO_NAME = "clarusway-repo/phonebook-app"
         // ECR repo isminin arka kismi
         APP_NAME = "phonebook"
-        AWS_STACK_NAME = "leon-Phonebook-App-${BUILD_NUMBER}"
+        AWS_STACK_NAME = "Serdar-Phonebook-App-${BUILD_NUMBER}"
         // hatali bir stack silerken bir baska stack ayaga kaldirmamiz gerekebilir, sonuna BUILD_NUMBER env variable i ekleyerek cakismayi engeleriz
         CFN_TEMPLATE="phonebook-docker-swarm-cfn-template.yml"
         // github reponun altinda bu isimle bulacagi template i infrastructure i ayaga kaldirmak icin kullanacak
